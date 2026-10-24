@@ -110,7 +110,7 @@
   const linkRota = (c) => 'https://www.google.com/maps/dir/?api=1&travelmode=walking&destination=' + encodeURIComponent(c.lat != null ? c.lat + ',' + c.lng : c.nome + ' ' + nomeCidade());
 
   /* ---------- OpenStreetMap (gratuito, sem chave) ---------- */
-  const OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+  const OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.private.coffee/api/interpreter', 'https://maps.mail.ru/osm/tools/overpass/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
   const DIAS = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
 
   function expandirDias(txt) {
@@ -174,15 +174,20 @@
   async function overpass(query) {
     let ultimoErro = null;
     for (const url of OVERPASS) {
+      const ctrl = new AbortController();
+      const limite = setTimeout(() => ctrl.abort(), 15000);
       try {
         const r = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: 'data=' + encodeURIComponent(query)
+          body: 'data=' + encodeURIComponent(query),
+          signal: ctrl.signal
         });
         if (!r.ok) throw new Error('HTTP ' + r.status);
-        return await r.json();
-      } catch (e) { ultimoErro = e; }
+        const j = await r.json();
+        clearTimeout(limite);
+        return j;
+      } catch (e) { clearTimeout(limite); ultimoErro = e; }
     }
     throw ultimoErro || new Error('overpass');
   }
@@ -224,6 +229,7 @@
         lat, lng,
         nota: null, avaliacoes: 0,
         foto: imagem, fotoCredito: null,
+        semana,
         horario: horarioDeHoje(semana),
         aberto: abertoAgora(semana),
         pet: t.dog === 'yes' || t.dog === 'leashed',
@@ -257,7 +263,18 @@
     state.erro = null;
     render();
     try {
-      const lista = await buscarOSM(state.cidade);
+      const cache = store.get('cache', {});
+      const salvo = cache[chave];
+      let lista;
+      if (salvo && Date.now() - salvo.t < 24 * 3600 * 1000) {
+        lista = salvo.cafes;
+      } else {
+        lista = await buscarOSM(state.cidade);
+        const novo = { [chave]: { t: Date.now(), cafes: lista } };
+        Object.keys(cache).filter((k) => Date.now() - cache[k].t < 24 * 3600 * 1000).slice(-3).forEach((k) => { novo[k] = cache[k]; });
+        store.set('cache', novo);
+      }
+      lista.forEach((c) => { const sem = c.semana; c.aberto = abertoAgora(sem); c.horario = horarioDeHoje(sem); });
       if (chaveCidade() !== chave) return;
       state.cafes = lista;
       registrarBairros(lista);
@@ -411,7 +428,13 @@
   }
 
   function sortear() {
-    if (!state.cafes) { state.sortearAoCarregar = true; carregarCafes(); return; }
+    if (!state.cafes || state.carregando) {
+      state.sortearAoCarregar = true;
+      state.fase = 'sorteando';
+      render();
+      if (!state.carregando) carregarCafes();
+      return;
+    }
     clearInterval(state.timer);
     const lista = candidatos(true);
     if (!lista.length) { state.fase = 'vazio'; render(); return; }
@@ -546,13 +569,10 @@
   }
 
   function conteudoCartao() {
-    if (state.carregando || (!state.cafes && !state.erro)) {
-      return '<div class="cartao-estado"><div class="pontos" aria-hidden="true"><span></span><span></span><span></span></div><p>Procurando cafés em ' + esc(nomeCidade()) + '…</p></div>';
-    }
-    if (state.erro) {
+    if (state.erro && !state.carregando) {
       return '<div class="cartao-estado"><span class="titulo">Ops, não deu certo.</span><p>' + esc(state.erro) + '</p><button type="button" class="btn btn-sec" data-acao="recarregar">Tentar de novo</button></div>';
     }
-    if (!state.cafes.length) {
+    if (state.cafes && !state.cafes.length && !state.carregando) {
       return '<div class="cartao-estado"><span class="titulo">Nenhum café encontrado.</span><p>Não achamos cafés em ' + esc(nomeCidade()) + '. Confira o nome da cidade.</p><a class="btn btn-sec" href="#/">Trocar cidade</a></div>';
     }
     if (state.fase === 'sorteando') {
@@ -563,10 +583,11 @@
     if (state.fase === 'vazio') {
       return '<div class="cartao-estado"><span class="titulo">Nenhum café com esses filtros.</span><p>Tente desligar alguns filtros' + (state.modoGrupo ? ' ou sair do sorteio do grupo' : '') + '.</p><button type="button" class="btn btn-sec" data-acao="limpar-filtros">Limpar filtros e sortear</button></div>';
     }
-    if (state.fase !== 'pronto' || !state.atual) {
+    if (state.fase !== 'pronto' || !state.atual || state.carregando) {
       return '<div class="cartao-estado"><svg width="120" height="120" viewBox="0 0 120 120" aria-hidden="true"><circle cx="60" cy="60" r="56" fill="#F2F0EB" stroke="#DDD7CD" stroke-width="2" stroke-dasharray="5 7"/><path d="M34 52h44v14a20 20 0 0 1-20 20h-4a20 20 0 0 1-20-20z" fill="#6B3F1D"/><path d="M78 55h5a8 8 0 0 1 0 16h-5" fill="none" stroke="#6B3F1D" stroke-width="5"/><path d="M46 30c0 5 4 5 4 10M58 26c0 5 4 5 4 10M70 30c0 5 4 5 4 10" fill="none" stroke="#B9B2A8" stroke-width="3" stroke-linecap="round"/></svg>' +
         '<span class="titulo">Um café novo, escolhido pra você.</span><p>Ajuste os filtros, se quiser, e deixa a sorte decidir.</p>' +
-        '<button type="button" class="btn btn-pri btn-grande" data-acao="sortear">' + ico.sortear + 'Sortear café</button></div>';
+        '<button type="button" class="btn btn-pri btn-grande" data-acao="sortear">' + ico.sortear + 'Sortear café</button>' +
+        (state.carregando ? '<p style="font-size:13px">Buscando os cafés de ' + esc(nomeCidade()) + ' no mapa…</p>' : '') + '</div>';
     }
     return cartaoPronto(state.atual);
   }
