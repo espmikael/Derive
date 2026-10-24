@@ -107,10 +107,10 @@
   };
   const dataBR = (iso) => { try { return new Date(iso).toLocaleDateString('pt-BR'); } catch (e) { return ''; } };
   const linkMapa = (c) => 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(c.lat != null ? c.lat + ',' + c.lng : c.nome + ' ' + nomeCidade());
+  const linkGoogle = (c) => 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent([c.nome, c.endereco, c.bairro, nomeCidade()].filter(Boolean).join(', '));
   const linkRota = (c) => 'https://www.google.com/maps/dir/?api=1&travelmode=walking&destination=' + encodeURIComponent(c.lat != null ? c.lat + ',' + c.lng : c.nome + ' ' + nomeCidade());
 
   /* ---------- OpenStreetMap (gratuito, sem chave) ---------- */
-  const OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.private.coffee/api/interpreter', 'https://maps.mail.ru/osm/tools/overpass/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
   const DIAS = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
 
   function expandirDias(txt) {
@@ -127,7 +127,10 @@
   // Entende os formatos mais comuns do opening_hours do OSM, ex.: "Mo-Fr 08:00-18:00; Sa 09:00-13:00; Su off".
   function lerHorario(oh) {
     if (!oh) return null;
-    const s = String(oh).trim();
+    const D = '(?:Mo|Tu|We|Th|Fr|Sa|Su)';
+    const s = String(oh).trim()
+      .replace(/,\s*PH\b/g, '').replace(/\bPH\s*,\s*/g, '')
+      .replace(new RegExp('(?<=\\d),\\s*(?=' + D + '(?:\\s*-\\s*' + D + ')?\\s+\\d)', 'g'), ';');
     if (s === '24/7') return Array(7).fill([[0, 1440]]);
     const semana = Array(7).fill(null);
     let entendeu = false;
@@ -171,76 +174,86 @@
     return hoje.map(([a, b]) => hh(a) + '–' + hh(b)).join(', ');
   }
 
-  async function overpass(query) {
-    let ultimoErro = null;
-    for (const url of OVERPASS) {
-      const ctrl = new AbortController();
-      const limite = setTimeout(() => ctrl.abort(), 15000);
-      try {
-        const r = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: 'data=' + encodeURIComponent(query),
-          signal: ctrl.signal
-        });
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        const j = await r.json();
-        clearTimeout(limite);
-        return j;
-      } catch (e) { clearTimeout(limite); ultimoErro = e; }
-    }
-    throw ultimoErro || new Error('overpass');
+  const espera = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function getJSON(url, ms) {
+    const ctrl = new AbortController();
+    const limite = setTimeout(() => ctrl.abort(), ms || 12000);
+    try {
+      const r = await fetch(url, { signal: ctrl.signal });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return await r.json();
+    } finally { clearTimeout(limite); }
   }
 
-  async function buscarOSM(cidade) {
-    if (cidade.lat == null) throw new Error('Não encontramos essa cidade no mapa. Confira o nome e tente de novo.');
-    const raio = cidade.geo ? 2500 : 7000;
-    const q = '[out:json][timeout:25];' +
-      '(nwr["amenity"="cafe"]["name"](around:' + raio + ',' + cidade.lat + ',' + cidade.lng + '););out center tags 300;' +
-      'node["place"~"^(suburb|neighbourhood|quarter)$"]["name"](around:' + (raio + 3000) + ',' + cidade.lat + ',' + cidade.lng + ');out tags;';
-    let j;
-    try { j = await overpass(q); } catch (e) { throw new Error('O mapa aberto não respondeu agora. Tente de novo em instantes.'); }
-    const els = j.elements || [];
-    const bairros = els.filter((e) => e.type === 'node' && e.tags && e.tags.place);
-    const cafes = els.filter((e) => e.tags && e.tags.amenity === 'cafe');
-    const maisPerto = (lat, lng) => {
-      let melhor = null, dMin = 2500;
-      bairros.forEach((b) => { const d = distanciaM({ lat, lng }, { lat: b.lat, lng: b.lon }); if (d < dMin) { dMin = d; melhor = b.tags.name; } });
-      return melhor;
+  function mapearNominatim(x) {
+    const t = x.extratags || {};
+    const a = x.address || {};
+    const semana = lerHorario(t.opening_hours);
+    const imagem = t.image && /^https:\/\/.+\.(jpe?g|png|webp)(\?.*)?$/i.test(t.image) ? t.image : null;
+    const insta = t['contact:instagram'] || '';
+    const nome = x.name || (x.display_name || '').split(',')[0];
+    return {
+      id: x.osm_type + '/' + x.osm_id,
+      nome,
+      endereco: a.road ? a.road + (a.house_number ? ', ' + a.house_number : '') : '',
+      bairro: a.suburb || a.neighbourhood || a.quarter || a.city_district || '',
+      lat: parseFloat(x.lat),
+      lng: parseFloat(x.lon),
+      nota: null, avaliacoes: 0,
+      foto: imagem, fotoCredito: null,
+      semana,
+      horario: horarioDeHoje(semana),
+      aberto: abertoAgora(semana),
+      pet: t.dog === 'yes' || t.dog === 'leashed',
+      externa: t.outdoor_seating === 'yes',
+      trabalhar: ['wlan', 'yes', 'wifi'].includes(t.internet_access),
+      pedir: null,
+      site: t.website || t['contact:website'] || null,
+      instagram: insta ? (insta.startsWith('http') ? insta : 'https://instagram.com/' + insta.replace(/^@/, '')) : null,
+      maps: null
     };
+  }
+
+  // Busca cafés no Nominatim (OpenStreetMap): primeiro a cidade, depois quatro quadrantes, 1 pedido por segundo.
+  // aoParcial é chamado com a primeira resposta, pra o sorteio já poder acontecer.
+  async function buscarOSM(cidade, aoParcial) {
+    const base = 'https://nominatim.openstreetmap.org/search?amenity=cafe&format=jsonv2&limit=40&extratags=1&addressdetails=1&accept-language=pt-BR';
+    const caixa = (x0, y0, x1, y1) => '&bounded=1&viewbox=' + [x0, y1, x1, y0].map((n) => n.toFixed(5)).join(',');
+    const pedidos = [];
+    if (cidade.geo && cidade.lat != null) {
+      const d = 0.03;
+      pedidos.push(caixa(cidade.lng - d, cidade.lat - d, cidade.lng + d, cidade.lat + d));
+    } else {
+      pedidos.push('&city=' + encodeURIComponent(cidade.nome) + (cidade.estado ? '&state=' + encodeURIComponent(cidade.estado) : '') + (cidade.pais === 'BR' || !cidade.pais ? '&countrycodes=br' : ''));
+      if (cidade.lat != null) {
+        // depois da primeira resposta, varre a cidade em quatro quadrantes pra achar mais cafés
+        const d = 0.07, la = cidade.lat, ln = cidade.lng;
+        pedidos.push(caixa(ln - d, la, ln, la + d), caixa(ln, la, ln + d, la + d), caixa(ln - d, la - d, ln, la), caixa(ln, la - d, ln + d, la));
+      }
+    }
+    const lista = [];
     const vistos = new Set();
-    return cafes.map((e) => {
-      const t = e.tags;
-      const lat = e.lat != null ? e.lat : (e.center && e.center.lat);
-      const lng = e.lon != null ? e.lon : (e.center && e.center.lon);
-      if (lat == null) return null;
-      const id = e.type + '/' + e.id;
-      const chave = t.name.toLowerCase() + '@' + lat.toFixed(3);
-      if (vistos.has(chave)) return null;
-      vistos.add(chave);
-      const semana = lerHorario(t.opening_hours);
-      const imagem = t.image && /^https:\/\/.+\.(jpe?g|png|webp)(\?.*)?$/i.test(t.image) ? t.image : null;
-      const insta = t['contact:instagram'] || '';
-      return {
-        id,
-        nome: t.name,
-        endereco: t['addr:street'] ? t['addr:street'] + (t['addr:housenumber'] ? ', ' + t['addr:housenumber'] : '') : '',
-        bairro: t['addr:suburb'] || t['addr:neighbourhood'] || maisPerto(lat, lng) || '',
-        lat, lng,
-        nota: null, avaliacoes: 0,
-        foto: imagem, fotoCredito: null,
-        semana,
-        horario: horarioDeHoje(semana),
-        aberto: abertoAgora(semana),
-        pet: t.dog === 'yes' || t.dog === 'leashed',
-        externa: t.outdoor_seating === 'yes',
-        trabalhar: ['wlan', 'yes', 'wifi'].includes(t.internet_access),
-        pedir: null,
-        site: t.website || t['contact:website'] || null,
-        instagram: insta ? (insta.startsWith('http') ? insta : 'https://instagram.com/' + insta.replace(/^@/, '')) : null,
-        maps: null
-      };
-    }).filter(Boolean);
+    for (let n = 0; n < pedidos.length; n++) {
+      if (n > 0) await espera(1100);
+      let res;
+      try {
+        res = await getJSON(base + pedidos[n]);
+      } catch (e) {
+        if (n === 0) throw new Error('O mapa aberto não respondeu agora. Tente de novo em instantes.');
+        continue;
+      }
+      res.forEach((x) => {
+        const c = mapearNominatim(x);
+        if (!c.nome || isNaN(c.lat)) return;
+        const chave = c.nome.toLowerCase() + '@' + c.lat.toFixed(3);
+        if (vistos.has(c.id) || vistos.has(chave)) return;
+        vistos.add(c.id); vistos.add(chave);
+        lista.push(c);
+      });
+      if (n === 0 && aoParcial && lista.length) aoParcial(lista.slice());
+    }
+    if (!lista.length && cidade.lat == null) throw new Error('Não encontramos essa cidade no mapa. Confira o nome e tente de novo.');
+    return lista;
   }
 
   async function nomeDaLocalizacao(lat, lng) {
@@ -263,16 +276,23 @@
     state.erro = null;
     render();
     try {
-      const cache = store.get('cache', {});
+      const cache = store.get('cache2', {});
       const salvo = cache[chave];
       let lista;
       if (salvo && Date.now() - salvo.t < 24 * 3600 * 1000) {
         lista = salvo.cafes;
       } else {
-        lista = await buscarOSM(state.cidade);
+        lista = await buscarOSM(state.cidade, (parcial) => {
+          if (chaveCidade() !== chave) return;
+          state.cafes = parcial;
+          state.cafesDe = chave;
+          state.carregando = null;
+          if (state.fase !== 'sorteando') render();
+          if (state.sortearAoCarregar && rota().path === '/cafe') { state.sortearAoCarregar = false; sortear(); }
+        });
         const novo = { [chave]: { t: Date.now(), cafes: lista } };
         Object.keys(cache).filter((k) => Date.now() - cache[k].t < 24 * 3600 * 1000).slice(-3).forEach((k) => { novo[k] = cache[k]; });
-        store.set('cache', novo);
+        store.set('cache2', novo);
       }
       lista.forEach((c) => { const sem = c.semana; c.aberto = abertoAgora(sem); c.horario = horarioDeHoje(sem); });
       if (chaveCidade() !== chave) return;
@@ -285,7 +305,7 @@
     }
     state.cafesDe = chave;
     state.carregando = null;
-    render();
+    if (state.fase !== 'sorteando') render();
     if (state.sortearAoCarregar && rota().path === '/cafe') {
       state.sortearAoCarregar = false;
       sortear();
@@ -350,7 +370,7 @@
       const g = res.find((x) => x.country_code === 'BR') || res[0];
       if (g) {
         const uf = g.country_code === 'BR' ? UF[g.admin1] : null;
-        cidade = { nome: g.name, rotulo: g.name + (uf ? ', ' + uf : (g.country ? ', ' + g.country : '')), lat: g.latitude, lng: g.longitude, geo: false };
+        cidade = { nome: g.name, rotulo: g.name + (uf ? ', ' + uf : (g.country ? ', ' + g.country : '')), lat: g.latitude, lng: g.longitude, geo: false, estado: g.admin1 || '', pais: g.country_code || '' };
       }
     } catch (e) { /* segue só com o nome */ }
     state.user = null;
@@ -482,6 +502,48 @@
     salvarVisitados(v);
   }
 
+  /* ---------- mini mapa (Leaflet + mapa do OpenStreetMap, gratuitos) ---------- */
+  let leafletPromise = null;
+  function carregarLeaflet() {
+    if (window.L) return Promise.resolve(window.L);
+    if (leafletPromise) return leafletPromise;
+    leafletPromise = new Promise((resolve, reject) => {
+      const css = document.createElement('link');
+      css.rel = 'stylesheet';
+      css.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+      document.head.appendChild(css);
+      const js = document.createElement('script');
+      js.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+      js.onload = () => resolve(window.L);
+      js.onerror = () => { leafletPromise = null; reject(new Error('leaflet')); };
+      document.head.appendChild(js);
+    });
+    return leafletPromise;
+  }
+  function montarMiniMapa() {
+    const el = document.getElementById('mini-mapa');
+    if (!el) return;
+    const lat = parseFloat(el.dataset.lat), lng = parseFloat(el.dataset.lng);
+    if (isNaN(lat)) return;
+    carregarLeaflet().then((L) => {
+      if (!document.body.contains(el) || el.dataset.pronto) return;
+      el.dataset.pronto = '1';
+      const mapa = L.map(el, {
+        center: [lat, lng], zoom: 17, zoomControl: false, attributionControl: true,
+        dragging: false, scrollWheelZoom: false, doubleClickZoom: false, boxZoom: false,
+        keyboard: false, touchZoom: false, tap: false
+      });
+      L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '© OpenStreetMap'
+      }).addTo(mapa);
+      L.marker([lat, lng], {
+        icon: L.divIcon({ className: 'pino-cafe', html: '<span></span>', iconSize: [44, 44], iconAnchor: [22, 22] }),
+        keyboard: false, interactive: false
+      }).addTo(mapa);
+    }).catch(() => { el.innerHTML = ilustracaoFachada; });
+  }
+
   /* ---------- rotas ---------- */
   function rota() {
     const h = location.hash.replace(/^#/, '') || '/';
@@ -543,7 +605,9 @@
   function chipsFiltros() {
     const f = state.filtros;
     const itens = [['naoFui', 'Só onde ainda não fui'], ['aberto', 'Aberto agora'], ['trabalhar', 'Tem Wi-Fi'], ['pet', 'Pet friendly'], ['externa', 'Área externa']];
-    return itens.map(([k, t]) => '<button type="button" class="chip" data-acao="filtro" data-f="' + k + '" aria-pressed="' + (f[k] ? 'true' : 'false') + '">' + t + '</button>').join('');
+    const lista = state.cafes || [];
+    const tem = { trabalhar: lista.some((c) => c.trabalhar), pet: lista.some((c) => c.pet), externa: lista.some((c) => c.externa) };
+    return itens.filter(([k]) => !(k in tem) || tem[k] || f[k] || !state.cafes).map(([k, t]) => '<button type="button" class="chip" data-acao="filtro" data-f="' + k + '" aria-pressed="' + (f[k] ? 'true' : 'false') + '">' + t + '</button>').join('');
   }
 
   function viewCafe() {
@@ -601,7 +665,7 @@
     const tags = [
       c.aberto === true ? '<span class="aberto">Aberto agora</span>' : '',
       c.aberto === false ? '<span class="fechado">Fechado agora</span>' : '',
-      c.horario ? '<span class="tag">Hoje: ' + esc(c.horario) + '</span>' : '<span class="tag">Horário não informado</span>',
+      c.horario ? '<span class="tag">Hoje: ' + esc(c.horario) + '</span>' : '<a class="tag tag-link" href="' + esc(linkGoogle(c)) + '" target="_blank" rel="noopener">Ver horário no Google Maps ↗</a>',
       c.pet ? '<span class="tag">Pet friendly</span>' : '',
       c.externa ? '<span class="tag">Área externa</span>' : '',
       c.trabalhar ? '<span class="tag">Wi-Fi</span>' : '',
@@ -619,7 +683,8 @@
     const textoWhats = 'Bora flanar até o ' + c.nome + '? ' + [c.endereco, c.bairro].filter(Boolean).join(' · ') + ' ' + linkMapa(c);
     const foto = c.foto
       ? '<img src="' + esc(c.foto) + '" alt="Foto de ' + esc(c.nome) + '" loading="lazy" referrerpolicy="no-referrer">' + (c.fotoCredito ? '<span class="credito">Foto: ' + esc(c.fotoCredito) + '</span>' : '')
-      : ilustracaoFachada;
+      : '<div id="mini-mapa" class="mini-mapa" data-lat="' + c.lat + '" data-lng="' + c.lng + '" role="img" aria-label="Mapa das ruas em volta de ' + esc(c.nome) + '"></div>' +
+        '<a class="ver-fotos" href="' + esc(linkGoogle(c)) + '" target="_blank" rel="noopener">Ver fotos ↗</a>';
     return '<div class="' + (state.animar ? 'surge' : '') + '"><div class="foto">' + foto +
       (fui ? '<span class="selo">Já fui</span>' : '') +
       (state.modoGrupo ? '<span class="selo selo-grupo">Ninguém do grupo foi</span>' : '') +
@@ -827,6 +892,7 @@
       default: corpo = viewHome();
     }
     app.innerHTML = topo(path) + corpo;
+    montarMiniMapa();
     state.animar = false;
     if (ultimaRota !== path) {
       window.scrollTo(0, 0);
