@@ -22,11 +22,6 @@ Sem chave do Google, o site abre em **modo demonstração**, com cafés de exemp
 
 ## Publicar no GitHub Pages
 
-1. Suba estes arquivos para um repositório (por exemplo `derive`).
-2. No repositório, vá em **Settings → Pages**.
-3. Em *Source*, escolha **Deploy from a branch**, branch `main`, pasta `/ (root)` e salve.
-4. Em um ou dois minutos o site fica em `https://SEU-USUARIO.github.io/derive/`.
-
 ## Ligar os cafés reais (Google)
 
 1. Acesse o [Google Cloud Console](https://console.cloud.google.com/) e crie um projeto.
