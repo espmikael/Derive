@@ -3,7 +3,6 @@
   'use strict';
 
   const CFG = window.DERIVE_CONFIG || {};
-  const DEMO = !CFG.GOOGLE_MAPS_API_KEY;
   const app = document.getElementById('app');
   const reduzMovimento = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -107,141 +106,147 @@
     dec: (s) => atob(s.replace(/-/g, '+').replace(/_/g, '/'))
   };
   const dataBR = (iso) => { try { return new Date(iso).toLocaleDateString('pt-BR'); } catch (e) { return ''; } };
-  const linkMapa = (c) => c.maps || ('https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(c.nome + ' ' + (c.endereco || '') + ' ' + nomeCidade()) + (c.id && !String(c.id).startsWith('demo') ? '&query_place_id=' + encodeURIComponent(c.id) : ''));
-  const linkRota = (c) => 'https://www.google.com/maps/dir/?api=1&travelmode=walking&destination=' + encodeURIComponent(c.lat != null ? c.lat + ',' + c.lng : c.nome + ' ' + nomeCidade()) + (c.id && !String(c.id).startsWith('demo') ? '&destination_place_id=' + encodeURIComponent(c.id) : '');
+  const linkMapa = (c) => 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(c.lat != null ? c.lat + ',' + c.lng : c.nome + ' ' + nomeCidade());
+  const linkRota = (c) => 'https://www.google.com/maps/dir/?api=1&travelmode=walking&destination=' + encodeURIComponent(c.lat != null ? c.lat + ',' + c.lng : c.nome + ' ' + nomeCidade());
 
-  /* ---------- Google Maps / Places ---------- */
-  let mapsPromise = null;
-  window.gm_authFailure = () => {
-    state.erro = 'A chave do Google não foi aceita. Confira se ela está liberada para o endereço deste site.';
-    state.carregando = null;
-    render();
-  };
-  function carregarGoogle() {
-    if (DEMO) return Promise.reject(new Error('demo'));
-    if (mapsPromise) return mapsPromise;
-    mapsPromise = new Promise((resolve, reject) => {
-      window.__deriveMapsOk = () => resolve();
-      const s = document.createElement('script');
-      s.src = 'https://maps.googleapis.com/maps/api/js?key=' + encodeURIComponent(CFG.GOOGLE_MAPS_API_KEY) +
-        '&v=weekly&language=pt-BR&region=BR&loading=async&callback=__deriveMapsOk';
-      s.async = true;
-      s.onerror = () => { mapsPromise = null; reject(new Error('Não foi possível carregar o Google Maps.')); };
-      document.head.appendChild(s);
+  /* ---------- OpenStreetMap (gratuito, sem chave) ---------- */
+  const OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+  const DIAS = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
+
+  function expandirDias(txt) {
+    const dias = new Set();
+    txt.split(',').forEach((parte) => {
+      const [a, b] = parte.split('-').map((x) => DIAS.indexOf(x.trim()));
+      if (a < 0) return;
+      if (b == null || b < 0) { dias.add(a); return; }
+      for (let i = a; ; i = (i + 1) % 7) { dias.add(i); if (i === b) break; }
     });
-    return mapsPromise;
+    return [...dias];
   }
 
-  const ITENS = [
-    ['Pão de queijo', /p[ãa]o de queijo/gi], ['Croissant', /croissant/gi], ['Cappuccino', /cap+uc+ino/gi],
-    ['Café coado', /caf[ée] coado|coado/gi], ['Espresso', /espress?o/gi], ['Latte', /\blatte\b/gi],
-    ['Mocha', /\bmocha\b/gi], ['Chocolate quente', /chocolate quente/gi], ['Cheesecake', /cheesecake/gi],
-    ['Brownie', /brownie/gi], ['Cookie', /cookie/gi], ['Torta', /\btortas?\b/gi], ['Bolo', /\bbolos?\b/gi],
-    ['Cuca', /\bcucas?\b/gi], ['Waffle', /waffle/gi], ['Panqueca', /panquecas?/gi], ['Tostada', /tostadas?/gi],
-    ['Croque', /croque/gi], ['Quiche', /quiche/gi], ['Empada', /empadas?/gi], ['Sanduíche', /sandu[íi]ches?/gi],
-    ['Cinnamon roll', /cinnamon roll|rol[ée] de canela/gi], ['Pastel de nata', /pastel de nata/gi],
-    ['Matcha', /matcha/gi], ['Frappé', /frapp[ée]/gi], ['Affogato', /affogato/gi], ['Cold brew', /cold brew/gi]
-  ];
-  function maisCitado(texto) {
-    let melhor = null, max = 0;
-    for (const [nome, re] of ITENS) {
-      const n = (texto.match(re) || []).length;
-      if (n > max) { max = n; melhor = nome; }
+  // Entende os formatos mais comuns do opening_hours do OSM, ex.: "Mo-Fr 08:00-18:00; Sa 09:00-13:00; Su off".
+  function lerHorario(oh) {
+    if (!oh) return null;
+    const s = String(oh).trim();
+    if (s === '24/7') return Array(7).fill([[0, 1440]]);
+    const semana = Array(7).fill(null);
+    let entendeu = false;
+    for (let regra of s.split(';')) {
+      regra = regra.trim();
+      if (!regra) continue;
+      if (/\bPH\b|\bSH\b|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|week/.test(regra)) continue;
+      const m = regra.match(/^((?:Mo|Tu|We|Th|Fr|Sa|Su)(?:\s*-\s*(?:Mo|Tu|We|Th|Fr|Sa|Su))?(?:\s*,\s*(?:Mo|Tu|We|Th|Fr|Sa|Su)(?:\s*-\s*(?:Mo|Tu|We|Th|Fr|Sa|Su))?)*)?\s*(.*)$/);
+      if (!m) return null;
+      const dias = m[1] ? expandirDias(m[1].replace(/\s/g, '')) : [0, 1, 2, 3, 4, 5, 6];
+      const resto = m[2].trim();
+      if (/^(off|closed)$/i.test(resto)) { dias.forEach((d) => { semana[d] = []; }); entendeu = true; continue; }
+      const faixas = [];
+      for (const f of resto.split(',')) {
+        const t = f.trim().match(/^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\+?$/);
+        if (!t) return null;
+        const a = +t[1] * 60 + +t[2];
+        let b = +t[3] * 60 + +t[4];
+        if (b <= a) b += 1440;
+        faixas.push([a, b]);
+      }
+      if (!faixas.length) return null;
+      dias.forEach((d) => { semana[d] = faixas; });
+      entendeu = true;
     }
-    return melhor;
+    return entendeu ? semana.map((x) => x || []) : null;
   }
-  function horarioHoje(oh) {
-    if (!oh || !oh.weekdayDescriptions || !oh.weekdayDescriptions.length) return null;
-    const s = oh.weekdayDescriptions[(new Date().getDay() + 6) % 7] || '';
-    const i = s.indexOf(':');
-    return i >= 0 ? s.slice(i + 1).trim() : s;
+  function abertoAgora(semana) {
+    if (!semana) return null;
+    const agora = new Date();
+    const d = (agora.getDay() + 6) % 7;
+    const min = agora.getHours() * 60 + agora.getMinutes();
+    if (semana[d].some(([a, b]) => min >= a && min < b)) return true;
+    return semana[(d + 6) % 7].some(([, b]) => b > 1440 && min + 1440 < b);
+  }
+  function horarioDeHoje(semana) {
+    if (!semana) return null;
+    const hoje = semana[(new Date().getDay() + 6) % 7];
+    if (!hoje.length) return 'fechado';
+    const hh = (m) => String(Math.floor((m % 1440) / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0');
+    return hoje.map(([a, b]) => hh(a) + '–' + hh(b)).join(', ');
   }
 
-  async function mapearPlace(p) {
-    let aberto = null;
-    try { aberto = await p.isOpen(); } catch (e) { aberto = null; }
-    const comps = p.addressComponents || [];
-    const pega = (t) => comps.find((x) => (x.types || []).includes(t));
-    const bairroC = pega('sublocality_level_1') || pega('sublocality') || pega('neighborhood');
-    const rua = pega('route'), num = pega('street_number');
-    const endereco = rua ? rua.shortText + (num ? ', ' + num.longText : '') : String(p.formattedAddress || '').split(' - ')[0];
-    const textos = (p.reviews || []).map((r) => String(r.text || '')).join(' \n ');
-    const foto = p.photos && p.photos[0];
-    let fotoUrl = null, fotoCredito = null;
-    if (foto) {
-      try { fotoUrl = foto.getURI({ maxWidth: 1200 }); } catch (e) { fotoUrl = null; }
-      const a = foto.authorAttributions && foto.authorAttributions[0];
-      fotoCredito = a ? a.displayName : null;
+  async function overpass(query) {
+    let ultimoErro = null;
+    for (const url of OVERPASS) {
+      try {
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: 'data=' + encodeURIComponent(query)
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return await r.json();
+      } catch (e) { ultimoErro = e; }
     }
-    const loc = p.location;
-    return {
-      id: p.id,
-      nome: p.displayName || 'Café',
-      endereco,
-      bairro: bairroC ? bairroC.longText : '',
-      lat: loc ? loc.lat() : null,
-      lng: loc ? loc.lng() : null,
-      nota: typeof p.rating === 'number' ? p.rating : null,
-      avaliacoes: p.userRatingCount || 0,
-      foto: fotoUrl,
-      fotoCredito,
-      horario: horarioHoje(p.regularOpeningHours),
-      aberto,
-      pet: p.allowsDogs === true,
-      externa: p.outdoorSeating === true,
-      trabalhar: /wi-?fi|tomadas?|notebook|trabalhar|estudar|home ?office/i.test(textos),
-      pedir: maisCitado(textos),
-      maps: p.googleMapsURI || null
-    };
+    throw ultimoErro || new Error('overpass');
   }
 
-  async function buscarGoogle(cidade) {
-    await carregarGoogle();
-    const { Place } = await google.maps.importLibrary('places');
-    const fields = ['id', 'displayName', 'formattedAddress', 'location', 'rating', 'userRatingCount', 'photos',
-      'regularOpeningHours', 'utcOffsetMinutes', 'addressComponents', 'allowsDogs', 'outdoorSeating',
-      'reviews', 'googleMapsURI', 'businessStatus'];
-    const centro = cidade.lat != null ? { lat: cidade.lat, lng: cidade.lng } : null;
-    const consultas = cidade.geo ? ['cafeteria', 'café'] : ['cafeteria em ' + cidade.nome, 'café em ' + cidade.nome];
-    const pedido = (q) => {
-      const req = { textQuery: q, fields, language: 'pt-BR', region: 'br', maxResultCount: 20 };
-      if (centro) req.locationBias = { center: centro, radius: cidade.geo ? 2500 : 8000 };
-      return Place.searchByText(req);
+  async function buscarOSM(cidade) {
+    if (cidade.lat == null) throw new Error('Não encontramos essa cidade no mapa. Confira o nome e tente de novo.');
+    const raio = cidade.geo ? 2500 : 7000;
+    const q = '[out:json][timeout:25];' +
+      '(nwr["amenity"="cafe"]["name"](around:' + raio + ',' + cidade.lat + ',' + cidade.lng + '););out center tags 300;' +
+      'node["place"~"^(suburb|neighbourhood|quarter)$"]["name"](around:' + (raio + 3000) + ',' + cidade.lat + ',' + cidade.lng + ');out tags;';
+    let j;
+    try { j = await overpass(q); } catch (e) { throw new Error('O mapa aberto não respondeu agora. Tente de novo em instantes.'); }
+    const els = j.elements || [];
+    const bairros = els.filter((e) => e.type === 'node' && e.tags && e.tags.place);
+    const cafes = els.filter((e) => e.tags && e.tags.amenity === 'cafe');
+    const maisPerto = (lat, lng) => {
+      let melhor = null, dMin = 2500;
+      bairros.forEach((b) => { const d = distanciaM({ lat, lng }, { lat: b.lat, lng: b.lon }); if (d < dMin) { dMin = d; melhor = b.tags.name; } });
+      return melhor;
     };
-    const resp = await Promise.allSettled(consultas.map(pedido));
-    const ok = resp.filter((r) => r.status === 'fulfilled');
-    if (!ok.length) throw new Error('Não deu pra buscar os cafés agora. Tente de novo em instantes.');
-    const vistos = new Map();
-    ok.forEach((r) => (r.value.places || []).forEach((p) => { if (!vistos.has(p.id)) vistos.set(p.id, p); }));
-    const lista = [...vistos.values()].filter((p) => !p.businessStatus || p.businessStatus === 'OPERATIONAL');
-    return Promise.all(lista.map(mapearPlace));
+    const vistos = new Set();
+    return cafes.map((e) => {
+      const t = e.tags;
+      const lat = e.lat != null ? e.lat : (e.center && e.center.lat);
+      const lng = e.lon != null ? e.lon : (e.center && e.center.lon);
+      if (lat == null) return null;
+      const id = e.type + '/' + e.id;
+      const chave = t.name.toLowerCase() + '@' + lat.toFixed(3);
+      if (vistos.has(chave)) return null;
+      vistos.add(chave);
+      const semana = lerHorario(t.opening_hours);
+      const imagem = t.image && /^https:\/\/.+\.(jpe?g|png|webp)(\?.*)?$/i.test(t.image) ? t.image : null;
+      const insta = t['contact:instagram'] || '';
+      return {
+        id,
+        nome: t.name,
+        endereco: t['addr:street'] ? t['addr:street'] + (t['addr:housenumber'] ? ', ' + t['addr:housenumber'] : '') : '',
+        bairro: t['addr:suburb'] || t['addr:neighbourhood'] || maisPerto(lat, lng) || '',
+        lat, lng,
+        nota: null, avaliacoes: 0,
+        foto: imagem, fotoCredito: null,
+        horario: horarioDeHoje(semana),
+        aberto: abertoAgora(semana),
+        pet: t.dog === 'yes' || t.dog === 'leashed',
+        externa: t.outdoor_seating === 'yes',
+        trabalhar: ['wlan', 'yes', 'wifi'].includes(t.internet_access),
+        pedir: null,
+        site: t.website || t['contact:website'] || null,
+        instagram: insta ? (insta.startsWith('http') ? insta : 'https://instagram.com/' + insta.replace(/^@/, '')) : null,
+        maps: null
+      };
+    }).filter(Boolean);
   }
 
   async function nomeDaLocalizacao(lat, lng) {
-    if (DEMO) return null;
     try {
-      await carregarGoogle();
-      const { Geocoder } = await google.maps.importLibrary('geocoding');
-      const { results } = await new Geocoder().geocode({ location: { lat, lng } });
-      for (const r of results || []) {
-        const c = (r.address_components || []).find((x) => x.types.includes('administrative_area_level_2') || x.types.includes('locality'));
-        if (c) {
-          const uf = (r.address_components || []).find((x) => x.types.includes('administrative_area_level_1'));
-          return { nome: c.long_name, uf: uf ? uf.short_name : '' };
-        }
-      }
-    } catch (e) { /* segue sem nome */ }
-    return null;
-  }
-
-  /* ---------- modo demonstração ---------- */
-  function cafesDemo() {
-    return [
-      { id: 'demo-relicario', nome: 'O Relicário Café', endereco: 'Av. João Pessoa, 1003', bairro: 'Farroupilha', lat: -30.0399, lng: -51.2199, nota: null, avaliacoes: 0, foto: null, horario: 'ter a sex 13h–20h · sáb e dom 10h–20h', aberto: null, pet: false, externa: false, trabalhar: false, pedir: 'Mini Bolo da Vovó', demo: true },
-      { id: 'demo-2', nome: 'Café de exemplo', endereco: 'Rua de exemplo, 100', bairro: 'Cidade Baixa', lat: -30.0410, lng: -51.2260, nota: null, avaliacoes: 0, foto: null, horario: null, aberto: null, pet: true, externa: true, trabalhar: true, pedir: null, demo: true },
-      { id: 'demo-3', nome: 'Outro café de exemplo', endereco: 'Rua de exemplo, 200', bairro: 'Bom Fim', lat: -30.0330, lng: -51.2140, nota: null, avaliacoes: 0, foto: null, horario: null, aberto: null, pet: false, externa: true, trabalhar: false, pedir: null, demo: true },
-      { id: 'demo-4', nome: 'Mais um café de exemplo', endereco: 'Rua de exemplo, 300', bairro: 'Moinhos de Vento', lat: -30.0260, lng: -51.2020, nota: null, avaliacoes: 0, foto: null, horario: null, aberto: null, pet: true, externa: false, trabalhar: true, pedir: null, demo: true }
-    ];
+      const r = await fetch('https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=10&accept-language=pt-BR&lat=' + lat + '&lon=' + lng);
+      const j = await r.json();
+      const a = j.address || {};
+      const nome = a.city || a.town || a.municipality || a.village;
+      if (!nome) return null;
+      const iso = a['ISO3166-2-lvl4'] || '';
+      return { nome, uf: iso.startsWith('BR-') ? iso.slice(3) : '' };
+    } catch (e) { return null; }
   }
 
   /* ---------- dados: carregar cafés e clima ---------- */
@@ -252,7 +257,7 @@
     state.erro = null;
     render();
     try {
-      const lista = DEMO ? cafesDemo() : await buscarGoogle(state.cidade);
+      const lista = await buscarOSM(state.cidade);
       if (chaveCidade() !== chave) return;
       state.cafes = lista;
       registrarBairros(lista);
@@ -468,7 +473,7 @@
   function topo(path) {
     const hojeHref = state.cidade ? '#/cafe' : '#/';
     const atual = (p) => (p === path || (p === '/cafe' && ['/', '/cafe', '/surpresa', '/grupo'].includes(path))) ? ' aria-current="page"' : '';
-    return '<header class="topo"><div class="wrap topo-in"><a class="marca" href="#/">Derivé</a>' +
+    return '<header class="topo"><div class="wrap topo-in"><a class="marca" href="#/" aria-label="Derivé, versão beta">Derivé<span class="beta" aria-hidden="true">beta</span></a>' +
       '<nav aria-label="Navegação principal">' +
       '<a href="' + hojeHref + '"' + atual('/cafe') + '>Hoje</a>' +
       '<a href="#/flanar"' + atual('/flanar') + '>Flanar</a>' +
@@ -498,7 +503,7 @@
       card(2, 'Permita-se flanar', 'Vá sem pressa e sem roteiro. O café é o destino, mas o passeio começa na primeira esquina.') +
       card(3, 'Outras cidades na sua cidade', 'Cada bairro tem seu jeito. Marque onde já foi e descubra os pedaços da cidade que você ainda não conhece.') +
       '</div></main>' +
-      '<footer class="rodape"><div class="wrap"><p>Perca-se na cidade,<br>encontre-se no café.</p><span>Derivé · cafés pela cidade, a pé</span></div></footer>';
+      '<footer class="rodape"><div class="wrap"><p>Perca-se na cidade,<br>encontre-se no café.</p><span>Derivé · cafés pela cidade, a pé · versão beta</span></div></footer>';
   }
   const card = (n, t, d) => '<div class="card-num"><span class="n">' + n + '</span><strong>' + t + '</strong><span>' + d + '</span></div>';
 
@@ -514,7 +519,7 @@
 
   function chipsFiltros() {
     const f = state.filtros;
-    const itens = [['naoFui', 'Só onde ainda não fui'], ['aberto', 'Aberto agora'], ['trabalhar', 'Bom pra trabalhar'], ['pet', 'Pet friendly'], ['externa', 'Área externa']];
+    const itens = [['naoFui', 'Só onde ainda não fui'], ['aberto', 'Aberto agora'], ['trabalhar', 'Tem Wi-Fi'], ['pet', 'Pet friendly'], ['externa', 'Área externa']];
     return itens.map(([k, t]) => '<button type="button" class="chip" data-acao="filtro" data-f="' + k + '" aria-pressed="' + (f[k] ? 'true' : 'false') + '">' + t + '</button>').join('');
   }
 
@@ -529,7 +534,6 @@
       ? '<div class="bloco-branco grupo-ativo">' + ico.pessoas + '<div class="txt"><strong>Sorteio do grupo</strong><small>Só cafés onde ninguém de vocês ' + (membros.length + 1) + ' foi ainda.</small></div><button type="button" class="link-ico" data-acao="sair-grupo">Sair</button></div>'
       : '<a class="bloco-branco" href="#/grupo">' + ico.pessoas + '<div class="txt"><strong>Vai com alguém?</strong><small>Derive em grupo e sorteie um café onde ninguém foi.</small></div>' + ico.seta + '</a>';
     return '<main class="wrap">' +
-      (DEMO ? '<p class="demo">Modo demonstração: os cafés são exemplos. Configure a chave do Google em <code>config.js</code> pra ver cafés reais.</p>' : '') +
       '<div class="cafe-layout"><section class="col-esq">' +
       '<div><h1 class="h-display">' + (state.fase === 'pronto' ? 'Perca-se no<br>próximo café.' : 'Seu café<br>de hoje') + '</h1>' +
       '<div class="cidade-linha"><strong>' + esc(state.cidade.rotulo) + '</strong><a href="#/">trocar cidade</a></div></div>' +
@@ -576,10 +580,12 @@
     const tags = [
       c.aberto === true ? '<span class="aberto">Aberto agora</span>' : '',
       c.aberto === false ? '<span class="fechado">Fechado agora</span>' : '',
-      c.horario ? '<span class="tag">Hoje: ' + esc(c.horario) + '</span>' : '',
+      c.horario ? '<span class="tag">Hoje: ' + esc(c.horario) + '</span>' : '<span class="tag">Horário não informado</span>',
       c.pet ? '<span class="tag">Pet friendly</span>' : '',
       c.externa ? '<span class="tag">Área externa</span>' : '',
-      c.trabalhar ? '<span class="tag">Bom pra trabalhar</span>' : ''
+      c.trabalhar ? '<span class="tag">Wi-Fi</span>' : '',
+      c.instagram ? '<a class="tag" href="' + esc(c.instagram) + '" target="_blank" rel="noopener">Instagram</a>' : '',
+      c.site ? '<a class="tag" href="' + esc(c.site) + '" target="_blank" rel="noopener">Site</a>' : ''
     ].join('');
     const pedir = c.pedir
       ? '<div class="pedir">' + ico.xicara + '<div><span class="sobretitulo">O que pedir</span><strong>' + esc(c.pedir) + '</strong><small>' + (c.demo ? 'Exemplo para a demonstração.' : 'O mais citado nas avaliações do Google.') + '</small></div></div>'
@@ -609,7 +615,7 @@
       '<a class="btn btn-sec" href="#/surpresa">' + ico.bussola + 'Ir no modo surpresa</a></div>' +
       '<div class="acoes2"><button type="button" class="link-ico" data-acao="sortear">' + ico.girar + 'Hoje não, sorteia outro</button>' +
       '<a class="link-ico" href="https://wa.me/?text=' + encodeURIComponent(textoWhats) + '" target="_blank" rel="noopener">' + ico.compartilhar + 'Chamar a galera</a></div>' +
-      (c.demo ? '' : '<p class="atrib">Dados e fotos: Google Maps</p>') +
+      '<p class="atrib">Dados © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">colaboradores do OpenStreetMap</a>. Falta informação? <a href="https://www.openstreetmap.org/' + esc(c.id) + '" target="_blank" rel="noopener">Edite no mapa</a>.</p>' +
       '</div></div>';
   }
 
